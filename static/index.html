@@ -1,0 +1,536 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>实时透明视频</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; }
+    body { margin: 0; min-height: 100vh; background: #111827; color: #f8fafc; }
+    main { width: min(1100px, 92vw); margin: 32px auto; }
+    .toolbar { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 18px; }
+    button { border: 0; border-radius: 8px; padding: 10px 18px; font-weight: 700; cursor: pointer; }
+    select { border: 1px solid #475569; border-radius: 8px; padding: 9px 12px; background: #1e293b; color: white; }
+    .range-control { display: flex; align-items: center; gap: 7px; color: #cbd5e1; }
+    .range-control input { width: 110px; accent-color: #22c55e; }
+    #start { background: #22c55e; color: #052e16; }
+    #stop { background: #334155; color: white; }
+    .file-picker { background: #38bdf8; color: #082f49; border-radius: 8px; padding: 10px 18px; font-weight: 700; cursor: pointer; }
+    .file-picker input { display: none; }
+    button:disabled, .file-picker.disabled { opacity: .55; cursor: not-allowed; }
+    #status { color: #94a3b8; }
+    .stage {
+      min-height: 480px; position: relative; overflow: hidden;
+      border-radius: 16px;
+      background-color: #e2e8f0;
+      background-image: linear-gradient(45deg,#cbd5e1 25%,transparent 25%),
+        linear-gradient(-45deg,#cbd5e1 25%,transparent 25%),
+        linear-gradient(45deg,transparent 75%,#cbd5e1 75%),
+        linear-gradient(-45deg,transparent 75%,#cbd5e1 75%);
+      background-size: 32px 32px;
+      background-position: 0 0,0 16px,16px -16px,-16px 0;
+    }
+    .subject-layer { position: fixed; z-index: 2147483647; left: 50%; top: 50%; transform: translate(-50%, -50%); cursor: grab; touch-action: none; user-select: none; }
+    .subject-layer.dragging { cursor: grabbing; }
+    canvas { display: block; max-width: 100vw; max-height: 75vh; background: transparent; }
+    .hidden { display: none; }
+    video { position: fixed; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+    .note { color: #94a3b8; line-height: 1.6; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>实时背景移除</h1>
+  <div class="toolbar">
+    <button id="start">启动摄像头</button>
+    <label id="filePicker" class="file-picker">选择本地视频<input id="videoFile" type="file" accept="video/*"></label>
+    <select id="removalMode" aria-label="抠图模式"><option value="green" selected>绿幕抠图</option><option value="person">RVM AI 人像抠图</option></select>
+    <select id="qualityMode" aria-label="画质"><option value="smooth">流畅 480p</option><option value="hd" selected>高清 720p</option><option value="ultra">超清 1080p</option></select>
+    <label id="greenStrengthLabel" class="range-control">去绿强度<input id="greenStrength" type="range" min="0" max="100" value="78"><span id="greenStrengthValue">78</span></label>
+    <label id="personStrengthLabel" class="range-control hidden">边缘收紧<input id="personStrength" type="range" min="0" max="100" value="65"><span id="personStrengthValue">65</span></label>
+    <button id="stop" disabled>停止</button>
+    <span id="status">尚未连接</span>
+  </div>
+  <div id="stage" class="stage"><div id="subjectLayer" class="subject-layer"><canvas id="output"></canvas><canvas id="streamOutput" class="hidden"></canvas></div></div>
+  <p class="note">没有摄像头时可选择本地视频。视频只在浏览器本地读取，通过 WebSocket 逐帧处理，服务端不会保存文件。透明 Canvas 是窗口级浮层，可拖到任意位置。画质越高越清晰，但 CPU 和本机传输开销也越高。</p>
+  <video id="source" playsinline muted loop></video>
+  <video id="remote" autoplay playsinline muted></video>
+</main>
+<script src="/static/vendor/tf.min.js"></script>
+<script>
+const startButton = document.querySelector('#start');
+const filePicker = document.querySelector('#filePicker');
+const videoFile = document.querySelector('#videoFile');
+const removalMode = document.querySelector('#removalMode');
+const qualityMode = document.querySelector('#qualityMode');
+const greenStrengthLabel = document.querySelector('#greenStrengthLabel');
+const greenStrength = document.querySelector('#greenStrength');
+const greenStrengthValue = document.querySelector('#greenStrengthValue');
+const personStrengthLabel = document.querySelector('#personStrengthLabel');
+const personStrength = document.querySelector('#personStrength');
+const personStrengthValue = document.querySelector('#personStrengthValue');
+const stopButton = document.querySelector('#stop');
+const statusLabel = document.querySelector('#status');
+const sourceVideo = document.querySelector('#source');
+const remoteVideo = document.querySelector('#remote');
+const stage = document.querySelector('#stage');
+const subjectLayer = document.querySelector('#subjectLayer');
+const canvas = document.querySelector('#output');
+const streamCanvas = document.querySelector('#streamOutput');
+const streamContext = streamCanvas.getContext('2d');
+const inputCanvas = document.createElement('canvas');
+const inputContext = inputCanvas.getContext('2d');
+let pc = null;
+let localStream = null;
+let renderId = null;
+let sourceObjectUrl = null;
+let processingSocket = null;
+let processingTimer = null;
+let frameInFlight = false;
+let dragState = null;
+let rvmModel = null;
+let rvmStates = [];
+let rvmRunId = 0;
+let rvmFrameCount = 0;
+let rvmFpsStartedAt = 0;
+const qualityProfiles = {
+  smooth: { width: 480, jpeg: 0.80, interval: 100, label: '流畅 480p' },
+  hd: { width: 720, jpeg: 0.90, interval: 80, label: '高清 720p' },
+  ultra: { width: 1080, jpeg: 0.95, interval: 80, label: '超清 1080p' }
+};
+
+function waitForIceGatheringComplete(connection) {
+  if (connection.iceGatheringState === 'complete') return Promise.resolve();
+  return new Promise(resolve => {
+    const listener = () => {
+      if (connection.iceGatheringState === 'complete') {
+        connection.removeEventListener('icegatheringstatechange', listener);
+        resolve();
+      }
+    };
+    connection.addEventListener('icegatheringstatechange', listener);
+  });
+}
+
+function createRenderer(video, target) {
+  const gl = target.getContext('webgl', { alpha: true, premultipliedAlpha: true });
+  if (!gl) throw new Error('浏览器不支持 WebGL');
+
+  const vertexSource = `
+    attribute vec2 a_position;
+    varying vec2 v_uv;
+    void main() {
+      v_uv = (a_position + 1.0) * 0.5;
+      gl_Position = vec4(a_position, 0.0, 1.0);
+    }`;
+  const fragmentSource = `
+    precision mediump float;
+    uniform sampler2D u_video;
+    varying vec2 v_uv;
+    void main() {
+      vec3 rgb = texture2D(u_video, vec2(v_uv.x * 0.5, v_uv.y)).rgb;
+      float alpha = texture2D(u_video, vec2(0.5 + v_uv.x * 0.5, v_uv.y)).r;
+      gl_FragColor = vec4(rgb * alpha, alpha);
+    }`;
+
+  function shader(type, source) {
+    const item = gl.createShader(type);
+    gl.shaderSource(item, source);
+    gl.compileShader(item);
+    if (!gl.getShaderParameter(item, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(item));
+    return item;
+  }
+
+  const program = gl.createProgram();
+  gl.attachShader(program, shader(gl.VERTEX_SHADER, vertexSource));
+  gl.attachShader(program, shader(gl.FRAGMENT_SHADER, fragmentSource));
+  gl.linkProgram(program);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(program));
+  gl.useProgram(program);
+
+  const buffer = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, -1,1, 1,-1, 1,1]), gl.STATIC_DRAW);
+  const position = gl.getAttribLocation(program, 'a_position');
+  gl.enableVertexAttribArray(position);
+  gl.vertexAttribPointer(position, 2, gl.FLOAT, false, 0, 0);
+
+  const texture = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, texture);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+
+  const draw = () => {
+    if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+      const width = Math.floor(video.videoWidth / 2);
+      const height = video.videoHeight;
+      if (width > 0 && height > 0 && (target.width !== width || target.height !== height)) {
+        target.width = width;
+        target.height = height;
+        gl.viewport(0, 0, width, height);
+      }
+      gl.bindTexture(gl.TEXTURE_2D, texture);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
+      gl.clearColor(0, 0, 0, 0);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
+    }
+    renderId = requestAnimationFrame(draw);
+  };
+  draw();
+}
+
+function setSourceControlsDisabled(disabled) {
+  startButton.disabled = disabled;
+  videoFile.disabled = disabled;
+  removalMode.disabled = disabled;
+  qualityMode.disabled = disabled;
+  greenStrength.disabled = disabled;
+  personStrength.disabled = disabled;
+  filePicker.classList.toggle('disabled', disabled);
+}
+
+function showOutput(mode) {
+  canvas.classList.toggle('hidden', mode !== 'webrtc');
+  streamCanvas.classList.toggle('hidden', mode !== 'websocket');
+}
+
+function resetSubjectPosition() {
+  subjectLayer.style.left = '50%';
+  subjectLayer.style.top = '50%';
+  subjectLayer.style.transform = 'translate(-50%, -50%)';
+}
+
+subjectLayer.addEventListener('pointerdown', event => {
+  event.preventDefault();
+  const layerRect = subjectLayer.getBoundingClientRect();
+  subjectLayer.style.transform = 'none';
+  subjectLayer.style.left = `${layerRect.left}px`;
+  subjectLayer.style.top = `${layerRect.top}px`;
+  dragState = {
+    pointerId: event.pointerId,
+    offsetX: event.clientX - layerRect.left,
+    offsetY: event.clientY - layerRect.top
+  };
+  subjectLayer.classList.add('dragging');
+  subjectLayer.setPointerCapture(event.pointerId);
+});
+
+subjectLayer.addEventListener('pointermove', event => {
+  if (!dragState || dragState.pointerId !== event.pointerId) return;
+  const maxLeft = Math.max(0, window.innerWidth - subjectLayer.offsetWidth);
+  const maxTop = Math.max(0, window.innerHeight - subjectLayer.offsetHeight);
+  const left = Math.min(maxLeft, Math.max(0, event.clientX - dragState.offsetX));
+  const top = Math.min(maxTop, Math.max(0, event.clientY - dragState.offsetY));
+  subjectLayer.style.left = `${left}px`;
+  subjectLayer.style.top = `${top}px`;
+});
+
+function endDrag(event) {
+  if (!dragState || dragState.pointerId !== event.pointerId) return;
+  dragState = null;
+  subjectLayer.classList.remove('dragging');
+  if (subjectLayer.hasPointerCapture(event.pointerId)) subjectLayer.releasePointerCapture(event.pointerId);
+}
+
+subjectLayer.addEventListener('pointerup', endDrag);
+subjectLayer.addEventListener('pointercancel', endDrag);
+
+async function connectStream(stream) {
+  localStream = stream;
+  if (localStream.getVideoTracks().length === 0) throw new Error('输入中没有视频轨道');
+
+  pc = new RTCPeerConnection();
+  pc.onconnectionstatechange = () => statusLabel.textContent = `连接状态：${pc.connectionState}`;
+  pc.ontrack = event => {
+    showOutput('webrtc');
+    remoteVideo.srcObject = new MediaStream([event.track]);
+    remoteVideo.play().catch(console.error);
+    if (!renderId) createRenderer(remoteVideo, canvas);
+  };
+  localStream.getVideoTracks().forEach(track => pc.addTrack(track, localStream));
+
+  await pc.setLocalDescription(await pc.createOffer());
+  await waitForIceGatheringComplete(pc);
+  const response = await fetch('/offer', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type })
+  });
+  if (!response.ok) throw new Error(await response.text());
+  await pc.setRemoteDescription(await response.json());
+  stopButton.disabled = false;
+}
+
+function sendLocalVideoFrame() {
+  const socket = processingSocket;
+  if (!socket || socket.readyState !== WebSocket.OPEN || frameInFlight) return;
+  if (sourceVideo.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || !sourceVideo.videoWidth) return;
+
+  const profile = qualityProfiles[qualityMode.value] || qualityProfiles.hd;
+  const width = Math.min(profile.width, sourceVideo.videoWidth);
+  const height = Math.max(2, Math.round(sourceVideo.videoHeight * width / sourceVideo.videoWidth));
+  if (inputCanvas.width !== width || inputCanvas.height !== height) {
+    inputCanvas.width = width;
+    inputCanvas.height = height;
+  }
+  inputContext.drawImage(sourceVideo, 0, 0, width, height);
+  inputCanvas.toBlob(blob => {
+    if (!blob || processingSocket !== socket || socket.readyState !== WebSocket.OPEN) return;
+    frameInFlight = true;
+    socket.send(blob);
+  }, 'image/jpeg', profile.jpeg);
+}
+
+function getGpuRenderer() {
+  const probe = document.createElement('canvas').getContext('webgl');
+  if (!probe) return 'WebGL';
+  const extension = probe.getExtension('WEBGL_debug_renderer_info');
+  return extension ? probe.getParameter(extension.UNMASKED_RENDERER_WEBGL) : 'WebGL';
+}
+
+async function ensureRvmModel() {
+  if (typeof tf === 'undefined') throw new Error('TensorFlow.js 加载失败');
+  if (tf.getBackend() !== 'webgl') await tf.setBackend('webgl');
+  await tf.ready();
+  if (!rvmModel) rvmModel = await tf.loadGraphModel('/static/rvm/model.json');
+  return rvmModel;
+}
+
+function resetRvmStates() {
+  if (rvmStates.length) tf.dispose(rvmStates);
+  rvmStates = [tf.scalar(0), tf.scalar(0), tf.scalar(0), tf.scalar(0)];
+}
+
+async function renderRvmFrame(runId) {
+  if (runId !== rvmRunId) return;
+  if (sourceVideo.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || !sourceVideo.videoWidth) {
+    requestAnimationFrame(() => renderRvmFrame(runId));
+    return;
+  }
+
+  const profile = qualityProfiles[qualityMode.value] || qualityProfiles.hd;
+  const width = Math.min(profile.width, sourceVideo.videoWidth);
+  const height = Math.max(2, Math.round(sourceVideo.videoHeight * width / sourceVideo.videoWidth));
+  if (inputCanvas.width !== width || inputCanvas.height !== height) {
+    inputCanvas.width = width;
+    inputCanvas.height = height;
+  }
+  inputContext.drawImage(sourceVideo, 0, 0, width, height);
+
+  let img = null;
+  let src = null;
+  let ratio = null;
+  let fgr = null;
+  let pha = null;
+  let rgba = null;
+  const previousStates = rvmStates;
+  try {
+    img = tf.browser.fromPixels(inputCanvas, 3);
+    src = tf.tidy(() => img.expandDims(0).div(255));
+    const longest = Math.max(width, height);
+    const downsample = longest <= 512 ? 1 : longest <= 1280 ? 0.6 : longest <= 1920 ? 0.4 : 0.25;
+    ratio = tf.scalar(downsample);
+    const outputs = await rvmModel.executeAsync(
+      { src, r1i: previousStates[0], r2i: previousStates[1], r3i: previousStates[2], r4i: previousStates[3], downsample_ratio: ratio },
+      ['fgr', 'pha', 'r1o', 'r2o', 'r3o', 'r4o']
+    );
+    [fgr, pha, ...rvmStates] = outputs;
+    const cutoff = 0.02 + 0.10 * (Number(personStrength.value) / 100);
+    rgba = tf.tidy(() => {
+      const foreground = fgr.squeeze([0]);
+      const alpha = pha.squeeze([0]).sub(cutoff).div(1 - cutoff).clipByValue(0, 1);
+      return tf.concat([foreground, alpha], -1).mul(255).clipByValue(0, 255).cast('int32');
+    });
+    const pixels = new Uint8ClampedArray(await rgba.data());
+    if (streamCanvas.width !== width || streamCanvas.height !== height) {
+      streamCanvas.width = width;
+      streamCanvas.height = height;
+    }
+    streamContext.putImageData(new ImageData(pixels, width, height), 0, 0);
+
+    rvmFrameCount += 1;
+    if (rvmFrameCount % 20 === 0) {
+      const fps = 1000 * rvmFrameCount / (performance.now() - rvmFpsStartedAt);
+      statusLabel.textContent = `RVM MobileNetV3 · ${tf.getBackend().toUpperCase()} · ${fps.toFixed(1)} FPS`;
+    }
+  } catch (error) {
+    console.error(error);
+    statusLabel.textContent = `RVM 运行失败：${error.message}`;
+    stopButton.disabled = false;
+    return;
+  } finally {
+    tf.dispose([img, src, ratio, fgr, pha, rgba, ...previousStates].filter(Boolean));
+  }
+  if (runId === rvmRunId) requestAnimationFrame(() => renderRvmFrame(runId));
+}
+
+async function startRvmProcessing() {
+  statusLabel.textContent = '正在加载 RVM MobileNetV3…';
+  await ensureRvmModel();
+  resetRvmStates();
+  showOutput('websocket');
+  rvmFrameCount = 0;
+  rvmFpsStartedAt = performance.now();
+  const runId = ++rvmRunId;
+  statusLabel.textContent = `RVM MobileNetV3 · WebGL · ${getGpuRenderer()}`;
+  stopButton.disabled = false;
+  requestAnimationFrame(() => renderRvmFrame(runId));
+}
+
+function startLocalProcessing() {
+  return new Promise((resolve, reject) => {
+    const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const mode = encodeURIComponent(removalMode.value);
+    const strength = (Number(greenStrength.value) / 100).toFixed(2);
+    const edgeStrength = (Number(personStrength.value) / 100).toFixed(2);
+    const socket = new WebSocket(`${protocol}//${location.host}/ws/process?mode=${mode}&strength=${strength}&person_strength=${edgeStrength}`);
+    socket.binaryType = 'arraybuffer';
+    processingSocket = socket;
+
+    socket.onopen = () => {
+      showOutput('websocket');
+      const profile = qualityProfiles[qualityMode.value] || qualityProfiles.hd;
+      statusLabel.textContent = `本地视频处理中 · ${profile.label}`;
+      processingTimer = window.setInterval(sendLocalVideoFrame, profile.interval);
+      sendLocalVideoFrame();
+      stopButton.disabled = false;
+      resolve();
+    };
+    socket.onmessage = async event => {
+      if (typeof event.data === 'string') {
+        try {
+          const message = JSON.parse(event.data);
+          if (message.type === 'ready') statusLabel.textContent = `本地视频处理中 · ${message.backend}`;
+        } catch (error) {
+          console.error(error);
+        }
+        return;
+      }
+      try {
+        const bitmap = await createImageBitmap(new Blob([event.data], { type: 'image/png' }));
+        if (streamCanvas.width !== bitmap.width || streamCanvas.height !== bitmap.height) {
+          streamCanvas.width = bitmap.width;
+          streamCanvas.height = bitmap.height;
+        }
+        streamContext.clearRect(0, 0, streamCanvas.width, streamCanvas.height);
+        streamContext.drawImage(bitmap, 0, 0);
+        bitmap.close();
+      } catch (error) {
+        console.error(error);
+      } finally {
+        frameInFlight = false;
+      }
+    };
+    socket.onerror = () => reject(new Error('无法连接本地视频处理通道'));
+    socket.onclose = () => {
+      if (processingSocket === socket) {
+        processingSocket = null;
+        frameInFlight = false;
+        statusLabel.textContent = '视频处理连接已断开';
+      }
+    };
+  });
+}
+
+async function startCamera() {
+  setSourceControlsDisabled(true);
+  statusLabel.textContent = '请求摄像头…';
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 24, max: 30 } }
+    });
+    localStream = stream;
+    sourceVideo.srcObject = stream;
+    await sourceVideo.play();
+    if (removalMode.value === 'person') await startRvmProcessing();
+    else await startLocalProcessing();
+  } catch (error) {
+    console.error(error);
+    stop(true);
+    statusLabel.textContent = `启动失败：${error.message}`;
+  }
+}
+
+async function startLocalVideo(file) {
+  setSourceControlsDisabled(true);
+  statusLabel.textContent = `读取本地视频：${file.name}`;
+  try {
+    sourceObjectUrl = URL.createObjectURL(file);
+    sourceVideo.src = sourceObjectUrl;
+    await sourceVideo.play();
+    if (removalMode.value === 'person') await startRvmProcessing();
+    else await startLocalProcessing();
+  } catch (error) {
+    console.error(error);
+    stop(true);
+    statusLabel.textContent = `启动失败：${error.message}`;
+  }
+}
+
+function stop(preserveStatus = false) {
+  rvmRunId += 1;
+  if (rvmStates.length && typeof tf !== 'undefined') tf.dispose(rvmStates);
+  rvmStates = [];
+  rvmFrameCount = 0;
+  if (renderId) cancelAnimationFrame(renderId);
+  renderId = null;
+  if (pc) pc.close();
+  pc = null;
+  if (processingTimer) window.clearInterval(processingTimer);
+  processingTimer = null;
+  if (processingSocket) {
+    const socket = processingSocket;
+    processingSocket = null;
+    socket.close();
+  }
+  frameInFlight = false;
+  if (localStream) localStream.getTracks().forEach(track => track.stop());
+  localStream = null;
+  remoteVideo.srcObject = null;
+  sourceVideo.pause();
+  sourceVideo.srcObject = null;
+  sourceVideo.removeAttribute('src');
+  sourceVideo.load();
+  if (sourceObjectUrl) URL.revokeObjectURL(sourceObjectUrl);
+  sourceObjectUrl = null;
+  streamContext.clearRect(0, 0, streamCanvas.width, streamCanvas.height);
+  showOutput('webrtc');
+  resetSubjectPosition();
+  videoFile.value = '';
+  startButton.disabled = false;
+  videoFile.disabled = false;
+  removalMode.disabled = false;
+  qualityMode.disabled = false;
+  greenStrength.disabled = false;
+  personStrength.disabled = false;
+  filePicker.classList.remove('disabled');
+  stopButton.disabled = true;
+  if (!preserveStatus) statusLabel.textContent = '已停止';
+}
+
+startButton.addEventListener('click', startCamera);
+removalMode.addEventListener('change', () => {
+  greenStrengthLabel.classList.toggle('hidden', removalMode.value !== 'green');
+  personStrengthLabel.classList.toggle('hidden', removalMode.value !== 'person');
+});
+greenStrength.addEventListener('input', () => {
+  greenStrengthValue.textContent = greenStrength.value;
+});
+personStrength.addEventListener('input', () => {
+  personStrengthValue.textContent = personStrength.value;
+});
+videoFile.addEventListener('change', event => {
+  const file = event.target.files && event.target.files[0];
+  if (file) startLocalVideo(file);
+});
+stopButton.addEventListener('click', () => stop());
+window.addEventListener('beforeunload', () => stop());
+</script>
+</body>
+</html>
+

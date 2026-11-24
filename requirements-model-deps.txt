@@ -1,0 +1,3 @@
+# Import-time dependency of mediapipe.python.solutions.drawing_utils.
+numpy>=1.26,<2
+matplotlib>=3.8,<4

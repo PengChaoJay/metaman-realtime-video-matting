@@ -1,0 +1,12 @@
+aiortc>=1.9,<2
+av>=12,<17
+absl-py>=2,<3
+attrs>=23,<26
+fastapi>=0.110,<1
+flatbuffers>=24,<26
+numpy>=1.26,<2
+opencv-python-headless==4.10.0.84
+protobuf>=4.25.3,<5
+pydantic>=2.6,<3
+uvicorn[standard]>=0.29,<1
+

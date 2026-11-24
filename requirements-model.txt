@@ -1,0 +1,4 @@
+# Installed with --no-deps intentionally. requirements.txt contains the
+# runtime dependencies needed by selfie_segmentation without pulling JAX,
+# Matplotlib, and the GUI-enabled OpenCV Contrib package.
+mediapipe==0.10.21
