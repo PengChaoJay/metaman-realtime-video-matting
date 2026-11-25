@@ -44,8 +44,10 @@
   <div class="toolbar">
     <button id="start">启动摄像头</button>
     <label id="filePicker" class="file-picker">选择本地视频<input id="videoFile" type="file" accept="video/*"></label>
+    <label id="imagePicker" class="file-picker">选择图片<input id="imageFile" type="file" accept="image/*"></label>
+    <button id="downloadImage" disabled>下载透明 PNG</button>
     <select id="removalMode" aria-label="抠图模式"><option value="green" selected>绿幕抠图</option><option value="person">RVM AI 人像抠图</option></select>
-    <select id="qualityMode" aria-label="画质"><option value="smooth">流畅 480p</option><option value="hd" selected>高清 720p</option><option value="ultra">超清 1080p</option></select>
+    <select id="qualityMode" aria-label="画质"><option value="smooth">流畅 480p</option><option value="hd" selected>高清 720p</option><option value="ultra">超清 1080p</option><option value="photo">图片 2K（最长边 2048）</option></select>
     <label id="greenStrengthLabel" class="range-control">去绿强度<input id="greenStrength" type="range" min="0" max="100" value="78"><span id="greenStrengthValue">78</span></label>
     <label id="personStrengthLabel" class="range-control hidden">边缘收紧<input id="personStrength" type="range" min="0" max="100" value="65"><span id="personStrengthValue">65</span></label>
     <button id="stop" disabled>停止</button>
@@ -61,6 +63,10 @@
 const startButton = document.querySelector('#start');
 const filePicker = document.querySelector('#filePicker');
 const videoFile = document.querySelector('#videoFile');
+const imageFile = document.querySelector('#imageFile');
+const imagePicker = document.querySelector('#imagePicker');
+const downloadImage = document.querySelector('#downloadImage');
+let selectedImage = null;
 const removalMode = document.querySelector('#removalMode');
 const qualityMode = document.querySelector('#qualityMode');
 const greenStrengthLabel = document.querySelector('#greenStrengthLabel');
@@ -186,6 +192,8 @@ function createRenderer(video, target) {
 function setSourceControlsDisabled(disabled) {
   startButton.disabled = disabled;
   videoFile.disabled = disabled;
+  imageFile.disabled = disabled;
+  imagePicker.classList.toggle('disabled', disabled);
   removalMode.disabled = disabled;
   qualityMode.disabled = disabled;
   greenStrength.disabled = disabled;
@@ -437,6 +445,8 @@ function startLocalProcessing() {
 }
 
 async function startCamera() {
+  selectedImage = null;
+  if (qualityMode.value === 'photo') qualityMode.value = 'ultra';
   setSourceControlsDisabled(true);
   statusLabel.textContent = '请求摄像头…';
   try {
@@ -457,6 +467,8 @@ async function startCamera() {
 }
 
 async function startLocalVideo(file) {
+  selectedImage = null;
+  if (qualityMode.value === 'photo') qualityMode.value = 'ultra';
   setSourceControlsDisabled(true);
   statusLabel.textContent = `读取本地视频：${file.name}`;
   try {
@@ -472,7 +484,110 @@ async function startLocalVideo(file) {
   }
 }
 
+async function keyStillImage() {
+  const jpeg = await new Promise(resolve => inputCanvas.toBlob(resolve, 'image/jpeg', 0.95));
+  if (!jpeg) throw new Error('图片编码失败');
+  const url = new URL('/ws/process', location.href);
+  url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  url.search = new URLSearchParams({ mode: 'green', strength: Number(greenStrength.value) / 100 });
+  const socket = new WebSocket(url);
+  try {
+    const png = await new Promise((resolve, reject) => {
+      socket.onopen = () => socket.send(jpeg);
+      socket.onmessage = event => {
+        if (event.data instanceof Blob) resolve(event.data);
+      };
+      socket.onerror = socket.onclose = () => reject(new Error('绿幕处理连接已断开'));
+    });
+    const bitmap = await createImageBitmap(png);
+    try {
+      streamContext.drawImage(bitmap, 0, 0);
+    } finally {
+      bitmap.close();
+    }
+  } finally {
+    socket.close();
+  }
+}
+
+async function matteStillImage(width, height) {
+  const model = await ensureRvmModel();
+  const inputs = tf.tidy(() => ({
+    src: tf.browser.fromPixels(inputCanvas).expandDims(0).div(255),
+    r1i: tf.scalar(0), r2i: tf.scalar(0), r3i: tf.scalar(0), r4i: tf.scalar(0),
+    downsample_ratio: tf.scalar(Math.min(1, 640 / Math.max(width, height)))
+  }));
+  let outputs;
+  let rgba;
+  try {
+    outputs = await model.executeAsync(inputs, ['fgr', 'pha']);
+    const [foreground, alpha] = outputs;
+    const cutoff = 0.02 + 0.10 * Number(personStrength.value) / 100;
+    rgba = tf.tidy(() => tf.concat([
+      foreground, alpha.sub(cutoff).div(1 - cutoff)
+    ], -1).squeeze([0]).clipByValue(0, 1).mul(255).round().cast('int32'));
+    const pixels = new Uint8ClampedArray(await rgba.data());
+    streamContext.putImageData(new ImageData(pixels, width, height), 0, 0);
+  } finally {
+    tf.dispose(inputs);
+    if (outputs) tf.dispose(outputs);
+    if (rgba) rgba.dispose();
+  }
+}
+
+async function processStillImage(file) {
+  selectedImage = file;
+  setSourceControlsDisabled(true);
+  downloadImage.disabled = true;
+  stopButton.disabled = true;
+  statusLabel.textContent = '正在处理图片…';
+  let bitmap;
+  try {
+    bitmap = await createImageBitmap(file);
+    const profile = qualityProfiles[qualityMode.value] || qualityProfiles.hd;
+    const maxSide = qualityMode.value === 'photo' ? 2048 : profile.width;
+    const scale = Math.min(1, maxSide / Math.max(bitmap.width, bitmap.height));
+    const width = Math.max(1, Math.round(bitmap.width * scale));
+    const height = Math.max(1, Math.round(bitmap.height * scale));
+    streamCanvas.width = inputCanvas.width = width;
+    streamCanvas.height = inputCanvas.height = height;
+    inputContext.drawImage(bitmap, 0, 0, width, height);
+    if (removalMode.value === 'green') {
+      await keyStillImage();
+      // Dark or uneven green can survive chroma keying as a faint grey veil.
+      const frame = streamContext.getImageData(0, 0, width, height);
+      const cutoff = 0.45 * Number(greenStrength.value) / 100;
+      const fade = Math.min(cutoff, 0.15);
+      if (fade > 0) {
+        for (let i = 3; i < frame.data.length; i += 4) {
+          const coverage = frame.data[i] / 255;
+          const weight = Math.max(0, Math.min(1, (coverage - cutoff) / fade));
+          frame.data[i] *= weight;
+        }
+        streamContext.putImageData(frame, 0, 0);
+      }
+    } else {
+      await matteStillImage(width, height);
+    }
+    streamContext.save();
+    streamContext.globalCompositeOperation = 'destination-in';
+    streamContext.drawImage(inputCanvas, 0, 0);
+    streamContext.restore();
+    showOutput('websocket');
+    downloadImage.disabled = false;
+    statusLabel.textContent = `图片已处理 · ${width} × ${height}`;
+  } catch (error) {
+    statusLabel.textContent = `图片处理失败：${error.message}`;
+  } finally {
+    bitmap?.close();
+    imageFile.value = '';
+    setSourceControlsDisabled(false);
+  }
+}
+
 function stop(preserveStatus = false) {
+  selectedImage = null;
+  downloadImage.disabled = true;
   rvmRunId += 1;
   if (rvmStates.length && typeof tf !== 'undefined') tf.dispose(rvmStates);
   rvmStates = [];
@@ -502,6 +617,8 @@ function stop(preserveStatus = false) {
   showOutput('webrtc');
   resetSubjectPosition();
   videoFile.value = '';
+  imageFile.disabled = false;
+  imagePicker.classList.remove('disabled');
   startButton.disabled = false;
   videoFile.disabled = false;
   removalMode.disabled = false;
@@ -526,7 +643,30 @@ personStrength.addEventListener('input', () => {
 });
 videoFile.addEventListener('change', event => {
   const file = event.target.files && event.target.files[0];
-  if (file) startLocalVideo(file);
+  if (file) {
+    downloadImage.disabled = true;
+    startLocalVideo(file);
+  }
+});
+imageFile.addEventListener('change', () => {
+  if (imageFile.files[0]) processStillImage(imageFile.files[0]);
+});
+for (const control of [qualityMode, removalMode, greenStrength, personStrength]) {
+  control.addEventListener('change', () => {
+    if (selectedImage) processStillImage(selectedImage);
+  });
+}
+startButton.addEventListener('click', () => { downloadImage.disabled = true; });
+downloadImage.addEventListener('click', () => {
+  streamCanvas.toBlob(blob => {
+    if (!blob) return;
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'background-removed.png';
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }, 'image/png');
 });
 stopButton.addEventListener('click', () => stop());
 window.addEventListener('beforeunload', () => stop());
